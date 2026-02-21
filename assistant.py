@@ -21,14 +21,30 @@ Loop behaviour:
 import fnmatch
 import json
 import os
+import random
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import anthropic
 
 MODEL = "claude-sonnet-4-6"
 MAX_RETRIES = 5          # max consecutive turns that end in tool errors
+
+API_MAX_RETRIES = 5      # max attempts for transient API errors
+API_BASE_DELAY  = 1.0    # seconds; delay = base * 2^attempt + uniform jitter in [0, 1)
+
+# Per-tool subprocess / wall-clock timeout in seconds.
+# Increase values here for slow machines or large codebases.
+TOOL_TIMEOUTS = {
+    "run_python":      60,
+    "write_file":      10,
+    "read_file":       10,
+    "search_code":     30,
+    "list_directory":  10,
+    "install_package": 120,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +186,7 @@ Workflow:
 def run_python(code: str) -> dict:
     result = subprocess.run(
         [sys.executable, "-c", code],
-        capture_output=True, text=True, timeout=60,
+        capture_output=True, text=True, timeout=TOOL_TIMEOUTS["run_python"],
     )
     return {
         "stdout":     result.stdout,
@@ -247,7 +263,7 @@ def list_directory(path: str = ".", recursive: bool = False) -> dict:
 def install_package(package: str) -> dict:
     result = subprocess.run(
         [sys.executable, "-m", "pip", "install", package],
-        capture_output=True, text=True, timeout=120,
+        capture_output=True, text=True, timeout=TOOL_TIMEOUTS["install_package"],
     )
     return {
         "stdout":     result.stdout[-2000:],   # trim verbose pip output
@@ -283,13 +299,49 @@ def execute_tool(name: str, tool_input: dict) -> tuple[str, bool]:
     try:
         result = fn(tool_input)
     except subprocess.TimeoutExpired:
-        return json.dumps({"error": "Tool timed out."}), True
+        limit = TOOL_TIMEOUTS.get(name, "?")
+        return json.dumps({"error": f"Tool timed out after {limit}s."}), True
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"Tool raised exception: {exc}"}), True
 
     # Treat non-zero returncode or a top-level 'error' key as an error
     is_error = bool(result.get("error") or result.get("returncode", 0) != 0)
     return json.dumps(result, indent=2), is_error
+
+
+# ---------------------------------------------------------------------------
+# API call with exponential backoff + jitter
+# ---------------------------------------------------------------------------
+
+def _call_api_with_backoff(client: anthropic.Anthropic, **kwargs) -> anthropic.types.Message:
+    """
+    Call client.messages.create, retrying on RateLimitError and APIConnectionError
+    with exponential backoff and uniform jitter.
+
+    Delay schedule (seconds, before jitter):
+      attempt 0 → 1s, attempt 1 → 2s, attempt 2 → 4s, attempt 3 → 8s, …
+    """
+    for attempt in range(API_MAX_RETRIES):
+        try:
+            return client.messages.create(**kwargs)
+        except anthropic.RateLimitError as exc:
+            if attempt == API_MAX_RETRIES - 1:
+                raise
+            delay = API_BASE_DELAY * (2 ** attempt) + random.uniform(0, 1)
+            print(
+                f"\n[API] Rate limited. Retrying in {delay:.1f}s "
+                f"(attempt {attempt + 1}/{API_MAX_RETRIES})…"
+            )
+            time.sleep(delay)
+        except anthropic.APIConnectionError as exc:
+            if attempt == API_MAX_RETRIES - 1:
+                raise
+            delay = API_BASE_DELAY * (2 ** attempt) + random.uniform(0, 1)
+            print(
+                f"\n[API] Connection error: {exc}. Retrying in {delay:.1f}s "
+                f"(attempt {attempt + 1}/{API_MAX_RETRIES})…"
+            )
+            time.sleep(delay)
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +367,8 @@ def run_agent(task: str) -> str:
     consecutive_errors = 0
 
     while True:
-        response = client.messages.create(
+        response = _call_api_with_backoff(
+            client,
             model=MODEL,
             max_tokens=4096,
             system=SYSTEM_PROMPT,
